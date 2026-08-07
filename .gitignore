@@ -25,3 +25,4 @@ docs/BACKERS.md
 
 # Social-card render cache (mkdocs-material[imaging]).
 .cache/
+.env
