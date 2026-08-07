@@ -1,7 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import JSZip from 'jszip';
-import { BookOpen, Boxes, ChevronDown, Circle as CircleHelp, CloudUpload, Copy, Download, FileCode, FileText, Folder, FolderOpen, GitBranch, Hop as Home, Menu, MoveVertical as MoreVertical, Plus, Settings, Sparkles, Terminal, Upload, WandSparkles, X } from 'lucide-react';
+import { BookOpen, Boxes, ChevronDown, Circle as CircleHelp, CloudUpload, Copy, Download, FileCode, FileText, Folder, FolderOpen, GitBranch, Hop as Home, Menu, MoveVertical as MoreVertical, Plus, Settings, Sparkles, Terminal, WandSparkles, X } from 'lucide-react';
+import { createSkillFromSource } from './skillGenerator';
+import { supabase } from './supabase';
 import './styles.css';
 
 const steps = ['Parsing', 'Extracting Text', 'Analyzing Structure', 'Distilling Chapters', 'Assembling SKILL.md'];
@@ -44,6 +46,9 @@ function App() {
   const [toast, setToast] = useState('');
   const [hostOpen, setHostOpen] = useState(false);
   const [activeNav, setActiveNav] = useState('Studio');
+  const [generatedFiles, setGeneratedFiles] = useState(Object.entries(fileBodies).map(([path, content]) => ({ path, content })));
+  const [saving, setSaving] = useState(false);
+  const [savedProject, setSavedProject] = useState(null);
   const inputRef = useRef(null);
   const toastTimer = useRef(null);
   const showToast = (message) => { window.clearTimeout(toastTimer.current); setToast(message); toastTimer.current = window.setTimeout(() => setToast(''), 2600); };
@@ -67,6 +72,37 @@ function App() {
     return () => window.clearTimeout(timer);
   }, [step, isProcessing, mode, projectName]);
 
+  useEffect(() => {
+    if (!isComplete || !selectedSource || savedProject || saving) return;
+    const saveGeneratedSkill = async () => {
+      setSaving(true);
+      setLogs((current) => [...current, 'Creating source-derived skill files…']);
+      try {
+        const files = await createSkillFromSource(selectedSource, projectName || 'untitled-skill');
+        const { data: project, error: projectError } = await supabase
+          .from('skill_projects')
+          .insert({ name: projectName || 'untitled-skill', source_name: selectedSource.name, extraction_mode: mode, target_host: host })
+          .select('id')
+          .maybeSingle();
+        if (projectError || !project) throw projectError || new Error('Could not save the generated skill.');
+        const { error: filesError } = await supabase.from('skill_files').insert(files.map((file, index) => ({ project_id: project.id, path: file.path, content: file.content, sort_order: index })));
+        if (filesError) throw filesError;
+        setGeneratedFiles(files);
+        setActiveFile('SKILL.md');
+        setSavedProject(project.id);
+        setLogs((current) => [...current, `Saved ${files.length} source-derived files to your project.`]);
+        showToast('Skill created from your source materials');
+      } catch (error) {
+        setSavedProject('failed');
+        setLogs((current) => [...current, error.message || 'Unable to create a skill from this source.']);
+        showToast(error.message || 'Could not create the skill');
+      } finally {
+        setSaving(false);
+      }
+    };
+    saveGeneratedSkill();
+  }, [isComplete, selectedSource, savedProject, saving, projectName, mode, host]);
+
   const pickFiles = () => inputRef.current?.click();
   const handleFiles = (fileList) => {
     const file = Array.from(fileList || [])[0];
@@ -75,7 +111,9 @@ function App() {
     setSelectedSource(file);
     setProjectName(cleanName);
     setActiveFile('SKILL.md');
-    setLogs([`Added ${file.name} (${Math.max(1, Math.round(file.size / 1024 / 1024))} MB) to this private browser session.`, 'Preparing conversion pipeline…']);
+    setSavedProject(null);
+    setGeneratedFiles([]);
+    setLogs([`Added ${file.name} (${Math.max(1, Math.round(file.size / 1024 / 1024))} MB) to this conversion.`, 'Preparing source-derived skill pipeline…']);
     setStep(0);
     showToast(`${file.name} is ready to convert`);
   };
@@ -86,9 +124,9 @@ function App() {
     catch { showToast('Copy is unavailable in this browser'); }
   };
   const downloadSkill = async () => {
-    if (!isComplete) { showToast('Finish processing before downloading'); return; }
+    if (!savedProject || savedProject === 'failed') { showToast('Wait until the source-derived skill has been saved'); return; }
     const zip = new JSZip();
-    Object.entries(fileBodies).forEach(([name, content]) => zip.file(name === 'SKILL.md' ? name : `references/${name}`, content.replace('Clean Code Handbook', projectName || 'Untitled Skill')));
+    generatedFiles.forEach((file) => zip.file(file.path, file.content));
     const blob = await zip.generateAsync({ type: 'blob' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -97,7 +135,9 @@ function App() {
   };
   const chooseNav = (label) => { setActiveNav(label); setMobileNav(false); showToast(label === 'Studio' ? 'You are already in Studio' : `${label} is planned for a future workspace update`); };
   const rawTokens = selectedSource ? Math.max(25600, Math.round(selectedSource.size / 4)) : 1248531;
-  const finalTokens = Math.max(1200, Math.round(rawTokens / 25.9));
+  const finalTokens = generatedFiles.reduce((total, file) => total + Math.ceil(file.content.length / 4), 0) || Math.max(1200, Math.round(rawTokens / 25.9));
+  const currentFile = generatedFiles.find((file) => file.path === activeFile) || generatedFiles[0];
+  const referenceFiles = generatedFiles.filter((file) => file.path !== 'SKILL.md');
 
   return <div className="app-shell">
     <input ref={inputRef} className="hidden-input" type="file" multiple accept=".pdf,.epub,.docx,.md,.markdown,.html,.htm,.rtf,.txt" onChange={(event) => handleFiles(event.target.files)} />
@@ -110,10 +150,10 @@ function App() {
     <main>
       <header className="topbar"><button className="hamburger" onClick={() => setMobileNav(true)} aria-label="Open menu"><Menu size={20}/></button><div></div><div className="efficiency"><b>24×–51×</b><span>Token Efficiency</span></div><button className="icon-btn" onClick={() => showToast('Your skill library is ready after conversion')} aria-label="Open skill library"><BookOpen size={19}/></button><button className="icon-btn" onClick={() => showToast('Tip: Choose technical mode when your source includes tables or code')} aria-label="Show tip"><Sparkles size={19}/></button></header>
       <section className="hero"><div><p className="eyebrow">PRIVATE SKILL WORKSPACE</p><h1>Turn any book or docs folder<br/>into an <em>AI skill in seconds</em></h1><p>book-to-skill distills books, docs, and papers into structured,<br/>agent-ready skills that are <strong>24×–51×</strong> more token efficient.</p></div><div className="hero-art"><div className="spark one"></div><div className="spark two"></div><div className="doc-chip pdf">PDF</div><div className="doc-chip md">MD</div><div className="doc-chip folder-chip"><Folder size={25}/></div><div className="open-book">⌁</div></div></section>
-      <section className="panel ingest"><h2><span>1.</span> Ingest Your Source</h2><button className="dropzone" onClick={pickFiles} onDragOver={(event) => event.preventDefault()} onDrop={handleDrop}><CloudUpload size={37}/><b>{selectedSource ? selectedSource.name : 'Drag & drop a book, document, or folder here'}</b><span>{selectedSource ? 'Ready for private conversion' : 'or click to browse'}</span><div className="format-list">{['PDF','EPUB','DOCX','MD','HTML','RTF','Folder'].map(x => <i key={x}>{x}</i>)}</div></button><div className="config-grid"><label>Skill Name <input className="input skill-input" value={projectName} onChange={(event) => setProjectName(event.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))} /><small>Auto-slug: {projectName || 'untitled-skill'}</small></label><div className="config-item">Extraction Mode <CircleHelp size={13}/><div className="toggle"><button className={mode==='text'?'chosen':''} onClick={() => setMode('text')}><b>Text-heavy (Fast)</b><small>pdftotext / pypdf</small></button><button className={mode==='tech'?'chosen':''} onClick={() => setMode('tech')}><b>Technical (Best)</b><small>Docling (tables, code)</small></button></div></div><label className="host-wrap">Target Host <button className="input host" onClick={() => setHostOpen(value => !value)}><span className="host-icon">✦</span><div><b>{host} {host === 'Claude' ? 'Code' : ''}</b><small>{hostChoices[host]}</small></div><ChevronDown size={16}/></button>{hostOpen && <div className="host-menu">{Object.keys(hostChoices).map(name => <button key={name} onClick={() => {setHost(name); setHostOpen(false);}}>{name} <small>{hostChoices[name]}</small></button>)}</div>}<small>Supports Claude, Copilot, Amp & more</small></label></div></section>
+      <section className="panel ingest"><h2><span>1.</span> Ingest Your Source</h2><button className="dropzone" onClick={pickFiles} onDragOver={(event) => event.preventDefault()} onDrop={handleDrop}><CloudUpload size={37}/><b>{selectedSource ? selectedSource.name : 'Drag & drop a book, document, or folder here'}</b><span>{selectedSource ? 'Ready for private conversion' : 'or click to browse'}</span><div className="format-list">{['EPUB','DOCX','MD','HTML','RTF','TXT'].map(x => <i key={x}>{x}</i>)}</div></button><div className="config-grid"><label>Skill Name <input className="input skill-input" value={projectName} onChange={(event) => setProjectName(event.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))} /><small>Auto-slug: {projectName || 'untitled-skill'}</small></label><div className="config-item">Extraction Mode <CircleHelp size={13}/><div className="toggle"><button className={mode==='text'?'chosen':''} onClick={() => setMode('text')}><b>Text-heavy (Fast)</b><small>pdftotext / pypdf</small></button><button className={mode==='tech'?'chosen':''} onClick={() => setMode('tech')}><b>Technical (Best)</b><small>Docling (tables, code)</small></button></div></div><label className="host-wrap">Target Host <button className="input host" onClick={() => setHostOpen(value => !value)}><span className="host-icon">✦</span><div><b>{host} {host === 'Claude' ? 'Code' : ''}</b><small>{hostChoices[host]}</small></div><ChevronDown size={16}/></button>{hostOpen && <div className="host-menu">{Object.keys(hostChoices).map(name => <button key={name} onClick={() => {setHost(name); setHostOpen(false);}}>{name} <small>{hostChoices[name]}</small></button>)}</div>}<small>Supports Claude, Copilot, Amp & more</small></label></div></section>
       <section className="panel processing"><h2><span>2.</span> Processing Your Source</h2><div className="steps">{steps.map((label, index) => <div className={'step ' + (index < step ? 'done ' : '') + (index === step && isProcessing ? 'current' : '')} key={label}><div>{index < step ? '✓' : index + 1}</div><b>{label}</b></div>)}</div>{terminalOpen ? <div className="terminal"><div className="terminal-title"><span>Live Terminal Output <i className={isProcessing ? 'pulse' : ''}></i>{isProcessing ? ' Streaming' : isComplete ? ' Complete' : ' Waiting'}</span><button onClick={() => setTerminalOpen(false)}>Collapse <ChevronDown size={13}/></button></div><pre>{logs.map((log,index) => `${String(index + 1).padStart(2,'0')}: ${log}`).join('\n')}</pre></div> : <button className="reopen" onClick={() => setTerminalOpen(true)}><Terminal size={15}/> Show live terminal output</button>}</section>
-      <section className="studio"><div className="panel inspector"><h2><span>3.</span> Skill Inspector & Preview Studio</h2><div className="preview-grid"><aside className="file-tree"><div className="tree-head"><b>Skill Files</b><small>9 files</small></div><button className={'tree-main '+(activeFile==='SKILL.md'?'selected':'')} onClick={() => setActiveFile('SKILL.md')}><FileText size={16}/> SKILL.md <MoreVertical size={15}/></button><div className="folder-line"><ChevronDown size={14}/><FolderOpen size={15}/> chapters/ <small>18</small></div>{chapterFiles.map(file => <button key={file} className={activeFile===file?'selected':''} onClick={() => setActiveFile(file)}><FileCode size={14}/>{file}</button>)}{['glossary.md','patterns.md','cheatsheet.md'].map(file => <button key={file} className={activeFile===file?'selected':''} onClick={() => setActiveFile(file)}><FileText size={15}/>{file}</button>)}</aside><article className="markdown"><div className="tabs"><button><FileText size={13}/>{activeFile}<X size={12}/></button><button className="plus" onClick={() => showToast('Choose another file from the skill tree')}><Plus size={17}/></button></div><div className="doc">{markdownParts((fileBodies[activeFile] || fileBodies['SKILL.md']).replace('Clean Code Handbook', projectName || 'Untitled Skill'))}</div></article></div></div><aside className="right-rail"><div className="panel stats"><h2>Token & Stats</h2><div className="donut"><div><b>~{Math.round(finalTokens / 100) / 10}k</b><span>tokens</span></div></div><dl><div><dt>Raw (Estimated)</dt><dd>{rawTokens.toLocaleString()}</dd></div><div><dt>Final (Estimated)</dt><dd>~{finalTokens.toLocaleString()}</dd></div><div><dt>Compression</dt><dd className="green">25.9×</dd></div><div><dt>Chapters</dt><dd>18</dd></div><div><dt>Files</dt><dd>9</dd></div></dl><p>Patterns <b>27</b></p><strong>{isComplete ? 'Skill ready to export' : isProcessing ? 'Building your skill…' : 'Choose a source to begin'}</strong></div><div className="panel export"><h2><span>4.</span> Export & Install</h2><button className="primary" onClick={downloadSkill} disabled={!isComplete}><Download size={16}/>Download ZIP<small>{isComplete ? 'Get your private skill package' : 'Available when processing completes'}</small></button><button onClick={copyInstall} disabled={!isComplete}><Copy size={16}/>Copy Install Command</button><button disabled><CloudUpload size={16}/>Save to Cloud (Soon)<small>Coming soon</small></button></div></aside></section>
-      <footer><div>Project: <b>{projectName || 'untitled-skill'}</b><span className={isComplete ? 'complete' : 'in-progress'}>● {isComplete ? 'Completed' : isProcessing ? 'Processing' : 'Waiting'}</span></div><div>Total Tokens <b>~{finalTokens.toLocaleString()}</b></div><div>Compression <b className="green">25.9×</b></div><div>Chapters <b>18</b></div><div>Files <b>9</b></div><div className="time">◷ <span>Privacy<br/><b>Local session only</b></span></div></footer>
+      <section className="studio"><div className="panel inspector"><h2><span>3.</span> Skill Inspector & Preview Studio</h2><div className="preview-grid"><aside className="file-tree"><div className="tree-head"><b>Skill Files</b><small>{generatedFiles.length} files</small></div>{currentFile && <button className={'tree-main '+(activeFile==='SKILL.md'?'selected':'')} onClick={() => setActiveFile('SKILL.md')}><FileText size={16}/> SKILL.md <MoreVertical size={15}/></button>}<div className="folder-line"><ChevronDown size={14}/><FolderOpen size={15}/> references/ <small>{referenceFiles.length}</small></div>{referenceFiles.map(file => <button key={file.path} className={activeFile===file.path?'selected':''} onClick={() => setActiveFile(file.path)}><FileCode size={14}/>{file.path.replace('references/','')}</button>)}</aside><article className="markdown"><div className="tabs"><button><FileText size={13}/>{activeFile}<X size={12}/></button><button className="plus" onClick={() => showToast('Choose another file from the skill tree')}><Plus size={17}/></button></div><div className="doc">{currentFile ? markdownParts(currentFile.content) : <p>Generating the source-derived skill files…</p>}</div></article></div></div><aside className="right-rail"><div className="panel stats"><h2>Token & Stats</h2><div className="donut"><div><b>~{Math.round(finalTokens / 100) / 10}k</b><span>tokens</span></div></div><dl><div><dt>Raw (Estimated)</dt><dd>{rawTokens.toLocaleString()}</dd></div><div><dt>Final (Estimated)</dt><dd>~{finalTokens.toLocaleString()}</dd></div><div><dt>Compression</dt><dd className="green">25.9×</dd></div><div><dt>Source guides</dt><dd>{referenceFiles.length}</dd></div><div><dt>Files</dt><dd>{generatedFiles.length}</dd></div></dl><p>Saved project <b>{savedProject && savedProject !== 'failed' ? 'Yes' : '—'}</b></p><strong>{saving ? 'Saving source-derived skill…' : savedProject && savedProject !== 'failed' ? 'Skill saved and ready to export' : isProcessing ? 'Building your skill…' : 'Choose a source to begin'}</strong></div><div className="panel export"><h2><span>4.</span> Export & Install</h2><button className="primary" onClick={downloadSkill} disabled={!savedProject || savedProject === 'failed'}><Download size={16}/>Download ZIP<small>{savedProject && savedProject !== 'failed' ? 'Get your saved skill package' : 'Available once source processing saves'}</small></button><button onClick={copyInstall} disabled={!savedProject || savedProject === 'failed'}><Copy size={16}/>Copy Install Command</button><button disabled><CloudUpload size={16}/>Save to Cloud (Soon)<small>Coming soon</small></button></div></aside></section>
+      <footer><div>Project: <b>{projectName || 'untitled-skill'}</b><span className={isComplete ? 'complete' : 'in-progress'}>● {isComplete ? 'Completed' : isProcessing ? 'Processing' : 'Waiting'}</span></div><div>Total Tokens <b>~{finalTokens.toLocaleString()}</b></div><div>Compression <b className="green">25.9×</b></div><div>Source guides <b>{referenceFiles.length}</b></div><div>Files <b>{generatedFiles.length}</b></div><div className="time">◷ <span>Storage<br/><b>Saved workspace</b></span></div></footer>
     </main>{toast && <div className="toast">{toast}</div>}</div>;
 }
 createRoot(document.getElementById('root')).render(<App/>);
